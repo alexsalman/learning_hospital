@@ -1,5 +1,5 @@
 # === index_documents.py ===
-# One-time script to process and index all PDFs in a folder
+# One-time script to process and index all PDFs in a folder (with images!)
 
 import os
 import fitz  # PyMuPDF
@@ -7,15 +7,30 @@ import faiss
 import numpy as np
 import pickle
 from sentence_transformers import SentenceTransformer
-import subprocess
+from transformers import CLIPProcessor, CLIPModel
+from PIL import Image
+import torch
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, message="resource_tracker: There appear to be .* leaked semaphore objects")
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # --- Config ---
-pdf_folder = "data"  # folder where your PDFs are stored
+pdf_folder = "data"
+image_folder = "extracted_images"
+os.makedirs(image_folder, exist_ok=True)
+
 output_index = "pdf_index.faiss"
 output_metadata = "pdf_metadata.pkl"
 model_name = "all-MiniLM-L6-v2"
+
+# --- Use MPS GPU if available ---
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+print(f"🔧 Using device: {device}")
+
+# --- Load CLIP Model for images ---
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
 # Map filenames to (doc title, source URL)
 pdf_sources = {
@@ -65,38 +80,89 @@ def chunk_text(text, max_chars=1000):
         chunks.append(text.strip())
     return chunks
 
-# --- Load Model ---
-model = SentenceTransformer(model_name)
+def extract_images_from_pdf(pdf_path, pdf_file):
+    doc = fitz.open(pdf_path)
+    image_paths = []
+    for page_num in range(len(doc)):
+        images = doc.get_page_images(page_num)
+        for img_index, img in enumerate(images):
+            xref = img[0]
+            pix = fitz.Pixmap(doc, xref)
+            img_filename = f"{os.path.splitext(pdf_file)[0]}_page{page_num+1}_img{img_index+1}.png"
+            img_path = os.path.join(image_folder, img_filename)
+            try:
+                if pix.colorspace and pix.colorspace.n < 5:
+                    pix.save(img_path)
+                    image_paths.append((img_path, page_num+1))
+                else:
+                    pix1 = fitz.Pixmap(fitz.csRGB, pix)
+                    pix1.save(img_path)
+                    pix1 = None
+                    image_paths.append((img_path, page_num+1))
+            except Exception as e:
+                print(f"⚠️ Error saving {img_filename}: {e}")
+            finally:
+                pix = None
+    return image_paths
+
+def embed_image(image_path):
+    image = Image.open(image_path).convert("RGB")
+    inputs = clip_processor(images=image, return_tensors="pt").to(device)
+    outputs = clip_model.get_image_features(**inputs)
+    return outputs.detach().cpu().numpy()[0]  # 512-dim embedding, back to CPU for FAISS
+
+# --- Load Sentence-Transformer Model ---
+model = SentenceTransformer(model_name, device=device)
 
 # --- Process PDFs ---
 all_chunks = []
 sources = []
+all_embeddings = []
 
 for file in os.listdir(pdf_folder):
     if not file.endswith(".pdf"):
         continue
     pdf_path = os.path.join(pdf_folder, file)
     doc = fitz.open(pdf_path)
-
     title, url = pdf_sources.get(file, (os.path.splitext(file)[0], "Unknown Source"))
 
+    # Text chunks
     for page_num, page in enumerate(doc, start=1):
         text = page.get_text()
         for chunk in chunk_text(text):
             all_chunks.append(chunk)
             sources.append(f"{title} (Page {page_num}) - {url}")
 
-# --- Embed ---
-print(f"Embedding {len(all_chunks)} chunks...")
-embeddings = model.encode(all_chunks, convert_to_numpy=True)
+    # Image chunks
+    image_paths = extract_images_from_pdf(pdf_path, file)
+    for img_path, page_num in image_paths:
+        emb = embed_image(img_path)
+        all_chunks.append(f"Image: {os.path.basename(img_path)}")
+        sources.append(f"{title} (Page {page_num}, Image) - {url}")
+        all_embeddings.append(emb)
 
-# --- FAISS Index ---
-index = faiss.IndexFlatL2(embeddings.shape[1])
-index.add(embeddings)
+# --- Embed Text Chunks ---
+print(f"Embedding {len(all_chunks) - len(all_embeddings)} text chunks...")
+text_embeddings = model.encode(
+    all_chunks[:-len(all_embeddings)] if all_embeddings else all_chunks,
+    convert_to_numpy=True,
+    device=device
+)
+
+# --- Combine Embeddings (pad text to 512 dims for alignment) ---
+if text_embeddings.shape[1] < 512:
+    pad_width = 512 - text_embeddings.shape[1]
+    text_embeddings = np.hstack([text_embeddings, np.zeros((text_embeddings.shape[0], pad_width))])
+
+combined_embeddings = np.vstack([text_embeddings, np.array(all_embeddings)])
+
+# --- Save FAISS Index ---
+index = faiss.IndexFlatL2(combined_embeddings.shape[1])
+index.add(combined_embeddings)
 faiss.write_index(index, output_index)
 
 # --- Save Metadata ---
 with open(output_metadata, "wb") as f:
     pickle.dump({"chunks": all_chunks, "sources": sources}, f)
 
-print("Index and metadata saved.")
+print("✅ Index and metadata saved, including images!")
