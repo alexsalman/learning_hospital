@@ -1,2 +1,2 @@
-![workflow](Hospital KE.jpg)
+![workflow](HospitalKE.jpg)
 *By Tamara (UMP) and Ali (UNISI).*
